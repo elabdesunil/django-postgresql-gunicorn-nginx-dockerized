@@ -7,10 +7,15 @@ github: https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized
   - [Project Setup](#project-setup)
   - [Docker](#docker)
   - [Postgres](#postgres)
-      - [Get the following error?](#get-the-following-error)
       - [after solving error](#after-solving-error)
     - [Notes](#notes)
   - [Gunicorn](#gunicorn)
+  - [Production Dockerfile](#production-dockerfile)
+  - [Nginx](#nginx)
+  - [Static Files](#static-files)
+    - [Development](#development)
+    - [Production](#production)
+  - [Media Files](#media-files)
 
 ## Introduction
 
@@ -268,13 +273,13 @@ Run the migrations:
 docker-compose exec web python manage.py migrate --noinput
 ```
 
-#### Get the following error?
+> #### Get the following error?
 
-```
-django.db.utils.OperationalError: FATAL: database "hello_django_dev" does not exist
-```
+> ```
+> django.db.utils.OperationalError: FATAL: database "hello_django_dev" does not exist
+> ```
 
-Run `docker-compose down -v` to remove the volumes along with the containers. Then, re-build the images, run the containers, and apply the migrations.
+> Run `docker-compose down -v` to remove the volumes along with the containers. Then, re-build the images, run the containers, and apply the migrations.
 
 #### after solving error
 
@@ -556,8 +561,399 @@ Then, build the production images and spin up the containers:
 docker-compose -f docker-compose.prod.yml up -d --build
 ```
 
-Verify that the `hello_django_prod` database was created along with the default Django Tables. Test out the admin page at http://localhost:8000/admin. The static files are not being loaded anymore. This is expected since Debug mode is off. We'll fix this shortly.
+Verify that the `hello_django_prod` database was created along with the default Django Tables. Run the migrations:`docker-compose exec web python manage.py migrate --noinput` Test out the admin page at http://localhost:8000/admin. The static files are not being loaded anymore. This is expected since Debug mode is off. We'll fix this shortly.
 
-> How? Remember the commands `docker-compose exec db psql --username=hello_django --dbname=hello_django_prod`, `\L`, `\c hello_django_prod`, `\dt` and `\q`.
+> How? Remember the commands `docker-compose exec db psql --username=hello_django --dbname=hello_django_prod`, `\l`, `\c hello_django_prod`, `\dt` and `\q`.
 
 > Again, if the container fails to start, check for errors in the logs via `docker-compose -f docker-compose.prod.yml logs -f`.
+
+## Production Dockerfile
+
+Did you notice that we're still running the database flush (which clears out the database) and migrate commands every time the container is run? This is fine in development, but let's create a new entrypoint file for production.
+
+`entrypoint.prod.sh`:
+
+```shell
+#!/bin/sh
+
+if [ "$DATABASE"="postgres" ]
+then
+    echo "Waiting for postgreSQL..."
+
+    while ! nc -z $SQL_HOST $SQL_PORT; do
+        sleep 0.1
+    done
+
+    echo "PostgreSQL started"
+fi
+
+exec "$@"
+```
+
+Update the file permissions locally:
+
+```
+chmod +x app/entrypoint.prod.sh
+```
+
+To use this file, create a new Dockerfile called `Dockerfile.prod` for use with production builds:
+
+```Dockerfile
+
+###########
+# Builder #
+###########
+
+# pull official base image
+FROM python:3.8.3-alpine as builder
+
+# set work directory
+WORKDIR /usr/src/app
+
+# set environment variables
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+
+# install psycopg2 dependencies
+RUN apk update \
+    && apk add postgresql-dev gcc python3-dev musl-dev
+
+# lint
+RUN pip install --upgrade pip
+RUN pip install flake8
+COPY . .
+RUN flake8 --ignore=E501,F401 ./hello_django
+
+
+# install dependencies
+COPY ./requirements.txt .
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /usr/src/app/wheels -r requirements.txt
+
+#########
+# FINAL #
+#########
+
+# pull official base image
+FROM python:3.8.3-alpine
+
+# create directory for the app user
+RUN mkdir -p /home/app
+
+# create the app user
+RUN addgroup -S app && adduser -S app -G app
+
+# create the appropriate directories
+ENV HOME=/home/app
+ENV APP_HOME=/home/app/web
+ENV mkdir $APP_HOME
+WORKDIR $APP_HOME
+
+# install dependencies
+RUN apk update && apk add libpq
+COPY --from=builder /usr/src/app/wheels /wheels
+COPY --from=builder /usr/src/app/requirements.txt .
+RUN pip install --no-cache /wheels/*
+
+# copy entrypoint-prod.sh
+COPY ./entrypoint.prod.sh $APP_HOME
+
+# copy project
+COPY . $APP_HOME
+
+# chown all the files to the app user
+RUN chown -R app:app $APP_HOME
+
+# change to the app user
+USER app
+
+# run entrypoint.prod.sh
+ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
+```
+
+Here, we used a Docker [multi-stage](https://docs.docker.com/develop/develop-images/multistage-build/) build to reduce the final imag size. Essentially, `builder` is a temporary image that's used for building the Python wheels. The wheels are then copied over tot he final production image and the `builder` image is discarded.
+
+> You could take the multi-stage build [approach](https://stackoverflow.com/a/53101932/1799408) a step further and us a single Dockerfile instead of creating two Dockerfiles. Think of the pros and cons of using this over two different files.
+
+Did you notice that we created a non-root user? By default, Docker runs container processes as root inside of a container. This is a bad practice since attackers can gain root access to the Docker host if they manage to break out of the container. If you're root in the container, you'll be root on the host.
+
+Update the `web` service within the `docker-compose.prod.yml` file to build the `Dockerfile.prod`:
+
+```yml
+web:
+  build:
+    context: ./app
+    dockerfile: Dockerfile.prod
+  command: gunicorn hello_django.wsgi:application --bind 0.0.0.0:8000
+  ports:
+    - 8000:8000
+  env_file:
+    - ./.env.prod
+  depends_on:
+    - db
+```
+
+Try it out:
+
+```
+docker-compose -f docker-compose.prod.yml down -v
+docker-compose -f docker-compose.prod.yml up -d --build
+docker-compose -f docker-compose.prod.yml exec web python manage.py migrate --noinput
+```
+
+## Nginx
+
+Next, let's add Nginx into the mix to act as a reverse proxy for Gunicorn to handle client requests as well as serve static files.
+
+Add the service to `docker-compose.prod.yml`:
+
+```yml
+nginx:
+  build: ./nginx
+  ports:
+    - 1337:80
+  depends_on:
+    - web
+```
+
+Then, in the local project root, create the following files and foler:
+
+```
+└── nginx
+    ├── Dockerfile
+    └── nginx.conf
+```
+
+`Dockerfile`:
+
+```Dockerfile
+FROM nginx:1.19.0-alpine
+
+RUN rm /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/conf.d
+
+```
+
+`nginx.conf`:
+
+```conf
+upstream hello_django {
+    server web:8000;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://hello_django;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $host;
+        proxy_redirect off;
+    }
+}
+```
+
+> Review Using Ngnix and Nginx Plus as an Application Gateway with uWSGI and Django for more info on configuring Nginx to work with Django.
+
+Then, update the `web` service, in `docker-compose.prod.yml`, replacing `ports` with `expose`:
+
+```yml
+web:
+  build:
+    context: ./app
+    dockerfile: Dockerfile.prod
+  command: gunicorn hello_django.wsgi:application --bind 0.0.0.0:8000
+  expose:
+    - 8000
+  env_file:
+    - ./.env.prod
+  depends_on:
+    - db
+```
+
+Now, port 8000 is only exposed internally, to other Docker services. The port will no longer be published to the host machine.
+
+> For more on ports vs expose, review [this] Stack Overflow question.
+
+Test it out again.
+
+```
+docker-compose -f docker-compose.prod.yml down -v
+docker-compose -f docker-compose.prod.yml up -d --build
+docker-compose -f docker-compose.prod.yml exec web python manage.py migrate --noinput
+```
+
+Ensure the app is up and running at http://localhost:1337.
+
+Your project structure should now look like:
+
+```
+├── .env.dev
+├── .env.prod
+├── .env.prod.db
+├── .gitignore
+├── app
+│   ├── Dockerfile
+│   ├── Dockerfile.prod
+│   ├── entrypoint.prod.sh
+│   ├── entrypoint.sh
+│   ├── hello_django
+│   │   ├── __init__.py
+│   │   ├── asgi.py
+│   │   ├── settings.py
+│   │   ├── urls.py
+│   │   └── wsgi.py
+│   ├── manage.py
+│   └── requirements.txt
+├── docker-compose.prod.yml
+├── docker-compose.yml
+└── nginx
+    ├── Dockerfile
+    └── nginx.conf
+```
+
+Bring the containers down once done:
+
+```
+docker-compose -f docker-compose.prod.yml down -v
+```
+
+Since Gunicorn is an application server, it will not server up static files. So, how should both static and media files be handled in this particular configuration?
+
+## Static Files
+
+Update `settings.py`:
+
+```python
+STATIC_URL = "/staticfiles/"
+STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
+```
+
+### Development
+
+Now, any request to `http://localhost:8000/staticfiles/*` will be served from the "staticfiles" directory.
+
+To test, first re-build the images and spin up the new containers per usual. Ensure static files are still being served correctly at http://localhost:8000/admin.
+
+### Production
+
+For production, add a volume to the `web` and `nginx` services in `docker-compose.prod.yml` so that each container will share a directory named `staticfiles`:
+
+```yml
+version: "3.7"
+
+services:
+  web:
+    build:
+      context: ./app
+      dockerfile: Dockerfile.prod
+    command: gunicorn hello_django.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - static_volume:/home/app/web/staticfiles
+    expose:
+      - 8000
+    env_file:
+      - ./.env.prod
+    depends_on:
+      - db
+  db:
+    image: postgres:12.0-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - ./.env.prod.db
+  nginx:
+    build: ./nginx
+    volumes:
+      - static_volume:/home/app/web/staticfiles
+    ports:
+      - 1337:80
+    depends_on:
+      - web
+volumes:
+  postgres_data:
+  static_volume:
+```
+
+We need to also create the `/home/app/web/staticfiles` folder in `Dockerfile.prod`:
+
+```Dockerfile
+
+# create the appropriate directories
+ENV HOME=/home/app
+ENV APP_HOME=/home/app/web
+RUN mkdir $APP_HOME
+RUN mkdir $APP_HOME/staticfiles
+WORKDIR $APP_HOME
+```
+
+Why is this necessary?
+
+Docker Compose normally mounts named volumes as root. And since we're using a non-root user, we'll get a permission denied error when the `collectstatic` command is run if the directory does not already exist.
+
+To get around this, you can either:
+
+1. Create the folder in the Dockerfile, [link](https://github.com/docker/compose/issues/3270)
+2. Change the permissions of the directory after it's mounted, [link](https://stackoverflow.com/questions/40462189/docker-compose-set-user-and-group-on-mounted-volume/40510068#40510068)
+
+We used the former.
+
+Next, update the Nginx configuration to route static file requests to the `staticfiles` folder:
+
+```
+upstream hello_django{
+  server web:8000;
+}
+
+server{
+  listen 80;
+
+  location / {
+    proxy_pass http://hello_django;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Host $host;
+    proxy_redirect off;
+  }
+
+  location /staticfiles/ {
+    alias /home/app/web/staticfiles/;
+  }
+}
+```
+
+Spin down the development containers:
+
+```
+docker-compose down -v
+```
+
+Test:
+
+```
+docker-compose -f docker-compose.prod.yml up -d --build
+docker-compose -f docker-compose.prod.yml exec web python manage.py migrate --noinput
+docker-compose -f docker-compose.prod.yml exec web python manage.py collectstatic --no-input --clear
+```
+
+Again, requests to `http://localhost:1337/staticfiles/*` will be served from the "staticfiles" directory.
+
+Navigate to http://localhost:1337/admin and ensure the static assets load correctly.
+
+You can also verify the logs --via `docker-compose -f docker-compose.prod.yml logs -f` -- that requests to the static files are served up successfully via Nginx:
+
+```
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /admin/ HTTP/1.1" 302 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /admin/login/?next=/admin/ HTTP/1.1" 200 1928 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /staticfiles/admin/css/base.css HTTP/1.1" 304 0 "http://localhost:1337/admin/login/?next=/admin/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /staticfiles/admin/css/login.css HTTP/1.1" 304 0 "http://localhost:1337/admin/login/?next=/admin/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /staticfiles/admin/css/responsive.css HTTP/1.1" 304 0 "http://localhost:1337/admin/login/?next=/admin/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /staticfiles/admin/css/fonts.css HTTP/1.1" 304 0 "http://localhost:1337/admin/login/?next=/admin/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /staticfiles/admin/fonts/Roboto-Regular-webfont.woff HTTP/1.1" 304 0 "http://localhost:1337/staticfiles/admin/css/fonts.css" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+nginx_1  | 172.31.0.1 - - [13/Jun/2020:20:35:47 +0000] "GET /staticfiles/admin/fonts/Roboto-Light-webfont.woff HTTP/1.1" 304 0 "http://localhost:1337/staticfiles/admin/css/fonts.css" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.97 Safari/537.36" "-"
+```
+
+Bring the containers down once done:
+
+```
+docker-compose -f docker-compose.prod.yml down -v
+```
+
+## Media Files
