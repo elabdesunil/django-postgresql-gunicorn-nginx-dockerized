@@ -1,8 +1,7 @@
 # Dockerizing Django with Postgres, Gunicorn, and Nginx
 
-github: https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized.git
-
 - [Dockerizing Django with Postgres, Gunicorn, and Nginx](#dockerizing-django-with-postgres-gunicorn-and-nginx)
+  - [Project Summary.](#project-summary)
   - [Introduction](#introduction)
   - [Project Setup](#project-setup)
   - [Docker](#docker)
@@ -19,6 +18,10 @@ github: https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized
     - [Development](#development-1)
     - [Production](#production-1)
   - [Conclusion](#conclusion)
+
+## Project Summary.
+
+This extensive project has helped me better understand the process of setting up a docker and docker-compose to containerize a django application that uses gunicorn and database language Postgres. Upon completion of this project, I created a multicontainer application using docker-compose `docker-compose.prod.yml` -- that uses 3 services: `web` for django application, `db` for postgreSQL, and `nginx` for Nginx; which will be using named volumes: `postgres_data` to store postgreSQL data, `static_volume` to store static files used by django application, and `media_volume` that will hold the images uploaded by the user. The project uses Gunicorn, a WSGI HTTP server, with Nginx, an HTTP proxy server, to serve the web application.
 
 ## Introduction
 
@@ -69,6 +72,8 @@ Your project directory should look like:
     ├── manage.py
     └── requirements.txt
 ```
+
+After setting up django, the code will look like [this](https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized/tree/0f84814a900799a12d796edd7fce9e8f783ed269).
 
 ## Docker
 
@@ -155,6 +160,8 @@ docker-compose up -d
 ```
 
 Navigate to http://localhost:8000/ to again view the welcome screen.
+
+After setting up docker, the code will look like [this](https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized/tree/52f3c4f947b5f8c0df2d0cf785ed90167c54a98c).
 
 Check for errors in the logs if this doesn't work via `docker-compose logs -f`.
 
@@ -485,6 +492,8 @@ Instead, you can run them manually, after the containers spin up, like so:
 docker-compose exec web python manage.py flush --no-input
 docker-compose exec web python manage.py migrate
 ```
+
+After adding PostgreSQL support, the code will look like [this](https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized/tree/3d4f2daa8f9511c50529ede72f23e030d4c14cdc).
 
 ## Gunicorn
 
@@ -821,6 +830,8 @@ Bring the containers down once done:
 docker-compose -f docker-compose.prod.yml down -v
 ```
 
+After adding nginx, the code will look like [this](https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized/tree/213c1342536fe2ecd38349d03ac297aa59d441d3).
+
 Since Gunicorn is an application server, it will not server up static files. So, how should both static and media files be handled in this particular configuration?
 
 ## Static Files
@@ -960,6 +971,8 @@ Bring the containers down once done:
 ```
 docker-compose -f docker-compose.prod.yml down -v
 ```
+
+After adding the static files support, the code will look like [this](https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized/tree/477b481b9b69ae1dec7c5134cf22df0ac39408bb).
 
 ## Media Files
 
@@ -1158,6 +1171,7 @@ docker-compose -f docker-compose.prod.yml exec web python manage.py migrate --no
 docker-compose -f docker-compose.prod.yml exec web python manage.py collectstatic --no-input --clear
 ```
 
+After addming media files support, the code will like [this](https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized/tree/ef1b5ab9ce8a5aed8ffcefda907838702f929093).
 Test it out one final time:
 
 1. Upload an image at http://localhost:1337/.
