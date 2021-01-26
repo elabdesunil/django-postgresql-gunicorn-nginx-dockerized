@@ -16,6 +16,9 @@ github: https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized
     - [Development](#development)
     - [Production](#production)
   - [Media Files](#media-files)
+    - [Development](#development-1)
+    - [Production](#production-1)
+  - [Conclusion](#conclusion)
 
 ## Introduction
 
@@ -672,6 +675,8 @@ ENTRYPOINT ["/home/app/web/entrypoint.prod.sh"]
 
 Here, we used a Docker [multi-stage](https://docs.docker.com/develop/develop-images/multistage-build/) build to reduce the final imag size. Essentially, `builder` is a temporary image that's used for building the Python wheels. The wheels are then copied over tot he final production image and the `builder` image is discarded.
 
+> Flake8 is a python code linter tool. It is wrapper around PyFlakes, pycodestyle, and Ned Batchelder's McCabe script. In simple words, flake8 helps developers write a good python code by preventing syntax errors, typos, bad formatting, etc. Because I didn't understand it initially, it gave me a lot of errors while building docker containers. I figured that it is really easy to debug those errors. All we need to do is read the warnings indicated which looks like `F402 xxx xx xxx xx`, before it throws `The command '/bin/sh -c flake8 --ignore=E501,F401' returned a non-zero code: 1` error. Just improve the codes accordingly.
+
 > You could take the multi-stage build [approach](https://stackoverflow.com/a/53101932/1799408) a step further and us a single Dockerfile instead of creating two Dockerfiles. Think of the pros and cons of using this over two different files.
 
 Did you notice that we created a non-root user? By default, Docker runs container processes as root inside of a container. This is a bad practice since attackers can gain root access to the Docker host if they manage to break out of the container. If you're root in the container, you'll be root on the host.
@@ -957,3 +962,228 @@ docker-compose -f docker-compose.prod.yml down -v
 ```
 
 ## Media Files
+
+To test out the handling of media files, start by creating a new Django app:
+
+```
+docker-compose up -d --build
+docker-compose exec web python manage.py startapp upload
+```
+
+Add the new app to the `INSTALLED_APPS` list in `settings.py`:
+
+```python
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+
+    "upload",
+]
+```
+
+`app/upload/views.py`:
+
+```python
+from django.shortcuts import render
+from django.core.files.storage import FileSystemStorage
+
+
+def image_upload(request):
+    if request.method == "POST" and request.FILES["image_file"]:
+        image_file = request.FILES["image_file"]
+        fs = FileSystemStorage()
+        filename = fs.save(image_file.name, image_file)
+        image_url = fs.url(filename)
+        print(image_url)
+        return render(request, "upload.html", {
+            "image_url": image_url
+        })
+    return render(request, "upload.html")
+```
+
+Add a `templates` directory to the `app/upload` directory, and then add a new template called `upload.html`:
+
+```html
+{% block content %}
+
+  <form action="{% url "upload" %}" method="post" enctype="multipart/form-data">
+    {% csrf_token %}
+    <input type="file" name="image_file">
+    <input type="submit" value="submit" />
+  </form>
+
+  {% if image_url %}
+    <p>File uploaded at: <a href="{{ image_url }}">{{ image_url }}</a></p>
+  {% endif %}
+
+{% endblock %}
+```
+
+`app/hello_django/urls.py`:
+
+```python
+from django.contrib import admin
+from django.urls import path
+from django.conf import settings
+from django.conf.urls.static import static
+
+from upload.views import image_upload
+
+urlpatterns = [
+    path("", image_upload, name="upload"),
+    path("admin/", admin.site.urls),
+]
+
+if bool(settings.DEBUG):
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+```
+
+`app/hello_django/settings.py`:
+
+```python
+MEDIA_URL = "/mediafiles/"
+MEDIA_ROOT = os.path.join(BASE_DIR, "mediafiles")
+```
+
+### Development
+
+Test:
+
+```
+docker-compose up -d --build
+```
+
+You should be able to upload an image at http://localhost:8000/, and then view the image at http://localhost:8000/mediafiles/IMAGE_FILE_NAME.
+
+### Production
+
+For Production, add another volume to the `web` and `nginx` services:
+
+```yml
+version: "3.7"
+
+services:
+  web:
+    build:
+      context: ./app
+      dockerfile: Dockerfile.prod
+    command: gunicorn hello_django.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - static_volume:/home/app/web/staticfiles
+      - media_volume:/home/app/web/mediafiles
+    expose:
+      - 8000
+    env_file:
+      - ./.env.prod
+    depends_on:
+      - db
+  db:
+    image: postgres:12.0-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - ./.env.prod.db
+  nginx:
+    build: ./nginx
+    volumes:
+      - static_volume:/home/app/web/staticfiles
+      - media_volume:/home/app/web/mediafiles
+    ports:
+      - 1337:80
+    depends_on:
+      - web
+
+volumes:
+  postgres_data:
+  static_volume:
+  media_volume:
+```
+
+Create the `/home/app/web/mediafiles` folder in `Dockerfile.prod`:
+
+```Dockerfile
+# ...
+
+# create the appropriate directories
+ENV HOME=/home/app
+ENV APP_HOME=/home/app/web
+RUN mkdir $APP_HOME
+RUN mkdir $APP_HOME/staticfiles
+RUN mkdir $APP_HOME/mediafiles
+WORKDIR $APP_HOME
+
+# ...
+```
+
+Update the Nginx config again:
+
+```nginx
+upstream hello_django {
+    server web:8000;
+}
+
+server {
+
+    listen 80;
+
+    location / {
+        proxy_pass http://hello_django;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $host;
+        proxy_redirect off;
+    }
+
+    location /staticfiles/ {
+        alias /home/app/web/staticfiles/;
+    }
+
+    location /mediafiles/ {
+        alias /home/app/web/mediafiles/;
+    }
+
+}
+```
+
+Re-build:
+
+```
+docker-compose down -v
+
+docker-compose -f docker-compose.prod.yml up -d --build
+docker-compose -f docker-compose.prod.yml exec web python manage.py migrate --noinput
+docker-compose -f docker-compose.prod.yml exec web python manage.py collectstatic --no-input --clear
+```
+
+Test it out one final time:
+
+1. Upload an image at http://localhost:1337/.
+2. Then, view the image at http://localhost:1337/mediafiles/IMAGE_FILE_NAME.
+
+> If you see an `413 Request Entity Too Large` error, you'll need to increase the maximum allowed size of the client request body in either the server or location context within the Nginx conf. [link](https://stackoverflow.com/a/28476755/1799408)
+
+> Example:
+> Location / {
+> proxy_pass http://hello_django;
+> proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+> proxy_set_header Host $host;
+> proxy_redirect off;
+> client_max_body_size 100M;
+> }
+
+## Conclusion
+
+In this tutorial, we walked through how to containerize a Django web application with Postgres for development. We also created a production-ready Docker Compose file that adds Gunicorn and Nginx into the mix to handle static and media files. you can now test out a production setup locally.
+
+In term of actual deployment to a production environment, you'll probably want to use a:
+
+1. Fully managed database service like [RDS](https://aws.amazon.com/rds/) or Cloud [SQL](https://cloud.google.com/sql/), rather than managing your own Postgres instance within a container.
+2. Non-root user for the `db` and `nginx` services
+
+For other production tips, review this [discussion](https://www.reddit.com/r/django/comments/bjgod8/dockerizing_django_with_postgres_gunicorn_and/).
+The original code on [this](https://github.com/testdrivenio/django-on-docker) repo.
+
+The tutorial is copied from [here](https://testdriven.io/blog/dockerizing-django-with-postgres-gunicorn-and-nginx/). Thank you TestDriven.io for such a detailed article.
