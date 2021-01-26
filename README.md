@@ -1169,6 +1169,9 @@ docker-compose down -v
 docker-compose -f docker-compose.prod.yml up -d --build
 docker-compose -f docker-compose.prod.yml exec web python manage.py migrate --noinput
 docker-compose -f docker-compose.prod.yml exec web python manage.py collectstatic --no-input --clear
+
+
+docker-compose -f docker-compose.prod.yml down -v
 ```
 
 After addming media files support, the code will like [this](https://github.com/sunilale0/django-postgresql-gunicorn-nginx-dockerized/tree/ef1b5ab9ce8a5aed8ffcefda907838702f929093).
